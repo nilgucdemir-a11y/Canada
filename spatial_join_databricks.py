@@ -1,7 +1,27 @@
 """
-Nearest-neighbour spatial join in Databricks
-=============================================
+Nearest-neighbour spatial join in Databricks  (CRS: EPSG 4326)
+===============================================================
 Join a GPKG LineString layer to a 3.6-billion-row (lon, lat) table.
+
+CRS correctness notes
+---------------------
+Both tables are in EPSG:4326 (geographic, degrees).  Working directly in 4326
+introduces two silent errors that this script avoids:
+
+  1. ST_Distance in 4326 returns DEGREES, not metres.
+     → Use ST_DistanceSphere (metres on a sphere) or ST_DistanceSpheroid
+       (metres on the GRS-80 ellipsoid) for any reported distance value.
+     → For ranking (finding the *nearest*), degree distance is monotonic so
+       it still identifies the correct nearest feature – but never store it
+       as a metric distance.
+
+  2. ST_Buffer(geom, 0.01) in 4326 creates an ellipse, not a circle.
+     At 60 °N (central Canada) 0.01° longitude ≈ 555 m but
+     0.01° latitude ≈ 1 111 m.  A degree-buffer search radius is therefore
+     asymmetric and will miss nearby features to the east/west.
+     → Either reproject to EPSG:3347 (Statistics Canada Lambert), buffer
+       in metres, then reproject back; or inflate the degree radius to
+       account for the worst-case latitude distortion.
 
 Recommended stack
 -----------------
@@ -14,7 +34,7 @@ Three strategies are provided, ordered from simplest to most scalable:
 
   A. Sedona ST_KNN  – exact k-nearest, works well when the LineString
                       table is small enough to broadcast (~millions of rows).
-  B. Sedona range join + ST_Distance  – exact nearest via two-pass approach;
+  B. Sedona range join + ST_DistanceSphere  – exact nearest via two-pass;
                       handles both tables at arbitrary scale.
   C. H3 bucketing   – approximate nearest; extremely fast; use when a
                       ~100-metre approximation is acceptable.
@@ -22,11 +42,10 @@ Three strategies are provided, ordered from simplest to most scalable:
 
 # ── 0. Install / import ────────────────────────────────────────────────────
 # In a Databricks notebook cell run first:
-#   %pip install sedona apache-sedona keplergl  (then restart Python kernel)
+#   %pip install sedona apache-sedona  (then restart Python kernel)
 
 from sedona.spark import SedonaContext
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType
 
 # ── 1. Bootstrap Sedona ────────────────────────────────────────────────────
 config = (
@@ -67,12 +86,44 @@ coords_df = (
     spark.table(COORDS_TABLE)
     # or: spark.read.parquet("dbfs:/path/to/coords/")
     .select("point_id", "longitude", "latitude")
-    # Create a Sedona geometry column from lon/lat
+    # ST_Point(lon, lat) — note: X=longitude, Y=latitude (common mistake: swapping these)
+    # ST_SetSRID tags the geometry as 4326 so Sedona knows the CRS for
+    # ST_Transform, ST_DistanceSpheroid, etc.
     .withColumn(
         "point_geom",
-        F.expr("ST_Point(CAST(longitude AS DOUBLE), CAST(latitude AS DOUBLE))"),
+        F.expr("ST_SetSRID(ST_Point(CAST(longitude AS DOUBLE), CAST(latitude AS DOUBLE)), 4326)"),
     )
 )
+
+
+# ── CRS VALIDATION (run once before the join) ─────────────────────────────
+# Check 1: GPKG geometry SRID must be 4326
+lines_df.selectExpr("ST_SRID(line_geom) AS srid").distinct().show()
+# Expected output: 4326.  If you see 0 the GPKG has no embedded SRID —
+# fix with: lines_df = lines_df.withColumn("line_geom", F.expr("ST_SetSRID(line_geom, 4326)"))
+# If you see another value (e.g. 32617 / UTM) reproject:
+#   lines_df = lines_df.withColumn("line_geom",
+#       F.expr("ST_Transform(line_geom, 'EPSG:32617', 'EPSG:4326')"))
+
+# Check 2: Coordinate sanity for the coords table
+coords_df.selectExpr(
+    "MIN(longitude)", "MAX(longitude)",
+    "MIN(latitude)",  "MAX(latitude)",
+    "COUNT(*) AS total",
+    "SUM(CASE WHEN longitude NOT BETWEEN -180 AND 180 THEN 1 ELSE 0 END) AS bad_lon",
+    "SUM(CASE WHEN latitude  NOT BETWEEN  -90 AND  90 THEN 1 ELSE 0 END) AS bad_lat",
+    # Canada bounding box sanity check
+    "SUM(CASE WHEN longitude NOT BETWEEN -141 AND -52 THEN 1 ELSE 0 END) AS outside_canada_lon",
+    "SUM(CASE WHEN latitude  NOT BETWEEN   42 AND  84 THEN 1 ELSE 0 END) AS outside_canada_lat",
+).show()
+
+# Check 3: Confirm ST_Point(lon, lat) order is correct for a known location.
+# Vancouver: lon=-123.12, lat=49.28  → should render near the BC coast, not in the ocean.
+sedona.sql("""
+    SELECT ST_AsText(ST_SetSRID(ST_Point(-123.12, 49.28), 4326)) AS vancouver_wkt
+""").show(truncate=False)
+# Expected: POINT (-123.12 49.28)  — if you see POINT (49.28 -123.12) your
+# lon/lat columns are swapped in the source table.
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -86,6 +137,11 @@ def nearest_join_knn(coords_df, lines_df, k=1):
 
     ST_KNN performs a distributed KNN search using the R-tree index that
     Sedona builds automatically on the broadcast side.
+
+    CRS note: ST_KNN internally uses Euclidean distance in degree-space,
+    which is correct for finding the nearest neighbour (monotonic ranking)
+    but NOT for measuring the actual distance in metres.
+    ST_DistanceSphere is used here to report meaningful distances.
     """
     coords_df.createOrReplaceTempView("coords")
     lines_df.createOrReplaceTempView("lines")
@@ -94,7 +150,10 @@ def nearest_join_knn(coords_df, lines_df, k=1):
         SELECT
             c.point_id,
             l.line_id,
-            ST_Distance(c.point_geom, l.line_geom) AS dist_degrees
+            -- ST_DistanceSphere returns metres on a sphere (fast, ~0.3% error)
+            ST_DistanceSphere(c.point_geom, l.line_geom)     AS dist_metres,
+            -- ST_DistanceSpheroid uses the GRS-80 ellipsoid (most accurate, slower)
+            -- ST_DistanceSpheroid(c.point_geom, l.line_geom) AS dist_metres_exact
         FROM coords c
         JOIN lines l
         ON ST_KNN(c.point_geom, l.line_geom, {k}, true)
@@ -106,48 +165,98 @@ def nearest_join_knn(coords_df, lines_df, k=1):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# STRATEGY B – Range join + ST_Distance (exact; both tables distributed)
+# STRATEGY B – Range join + ST_DistanceSphere (exact; both tables distributed)
 # Best when: both tables are huge and LineStrings cannot be broadcast.
 # ══════════════════════════════════════════════════════════════════════════
 #
-# Idea:
-#   1. Pick a search radius R (degrees) that is guaranteed to contain at
-#      least one LineString for every point.
-#   2. Use ST_Intersects(ST_Buffer(point, R), line_geom) as the join
-#      predicate – Sedona optimises this with a spatial partition index.
-#   3. Rank results by distance and keep rank = 1.
+# CRS-correct approach for 4326:
 #
-# Finding a good R:
-#   * 0.01° ≈ 1 km at mid-latitudes  (good default for dense road networks)
-#   * If some points get no match, double R and rerun for those points only.
+#   OPTION B-1 (recommended):
+#     Reproject to EPSG:3347 (Statistics Canada Lambert), buffer in metres,
+#     then do the distance ranking in metres.  The reprojection is done
+#     on-the-fly inside Spark — no pre-materialisation needed.
+#
+#   OPTION B-2 (simpler, slight approximation):
+#     Stay in 4326 but inflate the degree radius to compensate for
+#     latitude distortion.  At 84°N (Canada's northern tip) 1° lon ≈ 111 km
+#     × cos(84°) ≈ 11.6 km — so the worst-case compression is ~cos(lat).
+#     Divide the desired metre radius by 111_320 * cos(max_lat_radians) to
+#     get a safe degree radius that always covers the intended distance.
 
-SEARCH_RADIUS_DEG = 0.01   # ≈ 1 km
+import math
+
+# ── B-1 : reproject to EPSG:3347 ──────────────────────────────────────────
+# Buffer radius in metres (tune to your data — for roads in Canada 2 km is
+# usually enough; sparse networks may need 10–20 km).
+SEARCH_RADIUS_M = 2_000   # metres
 
 coords_df.createOrReplaceTempView("coords")
 lines_df.createOrReplaceTempView("lines")
 
 nearest_range = sedona.sql(f"""
+    WITH projected AS (
+        -- Reproject both tables to Statistics Canada Lambert (EPSG:3347)
+        -- so that ST_Buffer creates a true circle in metres.
+        SELECT point_id,
+               ST_Transform(point_geom, 'EPSG:4326', 'EPSG:3347') AS pt_3347
+        FROM   coords
+    ),
+    lines_proj AS (
+        SELECT line_id,
+               ST_Transform(line_geom, 'EPSG:4326', 'EPSG:3347') AS ln_3347
+        FROM   lines
+    ),
+    candidates AS (
+        SELECT
+            p.point_id,
+            l.line_id,
+            -- Distance in metres (projected CRS, no spheroid approximation needed)
+            ST_Distance(p.pt_3347, l.ln_3347)  AS dist_metres,
+            ROW_NUMBER() OVER (
+                PARTITION BY p.point_id
+                ORDER BY     ST_Distance(p.pt_3347, l.ln_3347)
+            ) AS rn
+        FROM projected p
+        JOIN lines_proj l
+          ON ST_Intersects(
+               ST_Buffer(p.pt_3347, {SEARCH_RADIUS_M}),   -- true circle, metres
+               l.ln_3347
+             )
+    )
+    SELECT point_id, line_id, dist_metres
+    FROM   candidates
+    WHERE  rn = 1
+""")
+
+# ── B-2 : stay in 4326, inflate radius ────────────────────────────────────
+# Use this if ST_Transform is unavailable or too slow.
+# Canada spans ~42°N – 84°N.  Worst distortion is at the northernmost lat.
+MAX_LAT_DEG      = 84.0
+SEARCH_RADIUS_M2 = 2_000  # desired radius in metres
+
+# At max latitude, 1 degree longitude ≈ 111_320 * cos(lat) metres.
+# Divide desired metres by this to get the degree equivalent that is always
+# large enough everywhere in Canada.
+_deg_radius = SEARCH_RADIUS_M2 / (111_320 * math.cos(math.radians(MAX_LAT_DEG)))
+
+nearest_range_approx = sedona.sql(f"""
     WITH candidates AS (
         SELECT
             c.point_id,
-            c.point_geom,
             l.line_id,
-            l.line_geom,
-            ST_Distance(c.point_geom, l.line_geom)  AS dist_degrees,
-            -- Haversine-accurate distance in metres (optional, slower)
-            -- ST_DistanceSphere(c.point_geom, l.line_geom) AS dist_metres,
+            ST_DistanceSphere(c.point_geom, l.line_geom) AS dist_metres,
             ROW_NUMBER() OVER (
                 PARTITION BY c.point_id
-                ORDER BY ST_Distance(c.point_geom, l.line_geom)
+                ORDER BY     ST_DistanceSphere(c.point_geom, l.line_geom)
             ) AS rn
-        FROM coords      c
-        JOIN lines        l
+        FROM coords c
+        JOIN lines  l
           ON ST_Intersects(
-               ST_Buffer(c.point_geom, {SEARCH_RADIUS_DEG}),
+               ST_Buffer(c.point_geom, {_deg_radius:.6f}),
                l.line_geom
              )
     )
-    SELECT point_id, line_id, dist_degrees
+    SELECT point_id, line_id, dist_metres
     FROM   candidates
     WHERE  rn = 1
 """)
@@ -192,24 +301,44 @@ lines_h3 = (
     .drop("h3_cells")
 )
 
-# Join on H3 cell, then pick the nearest within each bucket
+# Join on H3 cell, then pick the nearest within each bucket.
+# ST_DistanceSphere is used here so the reported distance is in metres,
+# not degrees.  For the ORDER BY ranking, degree distance also gives the
+# correct nearest result (monotonic), but metres is more meaningful.
 nearest_h3 = (
     coords_h3.alias("c")
     .join(lines_h3.alias("l"), "h3_cell", "inner")
     .withColumn(
-        "dist",
-        F.expr("ST_Distance(c.point_geom, l.line_geom)"),
+        "dist_metres",
+        F.expr("ST_DistanceSphere(c.point_geom, l.line_geom)"),
     )
     .withColumn(
         "rn",
-        F.expr("ROW_NUMBER() OVER (PARTITION BY c.point_id ORDER BY dist)"),
+        F.expr("ROW_NUMBER() OVER (PARTITION BY c.point_id ORDER BY dist_metres)"),
     )
     .filter("rn = 1")
-    .select("c.point_id", "l.line_id", "dist")
+    .select("c.point_id", "l.line_id", "dist_metres")
 )
 
 # nearest_h3.write.mode("overwrite").saveAsTable("my_schema.nearest_line_h3")
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# SPOT-CHECK the result (run after any strategy)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 1. Visualise a sample in Kepler.gl or any GIS tool to confirm points
+#    snap to the expected linestrings and are not mirrored / transposed.
+#
+# 2. Manual sanity check: pick a known point (e.g. CN Tower, Toronto)
+#    and verify it matches a road/rail line, not a line in a different city.
+#
+# 3. Check distance distribution — if median dist_metres > 5 000 m your
+#    data likely has a lon/lat swap or a CRS mismatch.
+#
+# 4. Count unmatched points (no line within the search radius):
+#    unmatched_count = coords_df.join(result, "point_id", "left_anti").count()
+#    If > 0, rerun those points with a larger radius (see tip 5 below).
 
 # ══════════════════════════════════════════════════════════════════════════
 # Performance tips for 3.6 B rows
